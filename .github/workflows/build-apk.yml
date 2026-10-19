@@ -1,0 +1,236 @@
+
+name: Build CryptoAnalyser Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Locate project, build APK, verify output, and run lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Locate or safely extract Android project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="$(python3 - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          temp_root = Path(os.environ['RUNNER_TEMP']) / 'cryptoanalyser-projects'
+          ignored = {
+              '.git', '.gradle', '.idea', 'build',
+              'node_modules', '.kotlin'
+          }
+
+          def find_roots(base):
+              found = []
+              if not base.exists():
+                  return found
+              for current, dirs, files in os.walk(base):
+                  dirs[:] = [d for d in dirs if d not in ignored]
+                  p = Path(current)
+                  settings = (
+                      'settings.gradle' in files
+                      or 'settings.gradle.kts' in files
+                  )
+                  app = (
+                      (p / 'app' / 'build.gradle').is_file()
+                      or (p / 'app' / 'build.gradle.kts').is_file()
+                  )
+                  if settings and app:
+                      found.append(p.resolve())
+              return found
+
+          # Prefer an already extracted Android project.
+          roots = find_roots(repo)
+          if roots:
+              print(sorted(
+                  roots, key=lambda p: (len(p.parts), str(p))
+              )[0])
+              raise SystemExit(0)
+
+          # Otherwise, search for the project inside ZIP files.
+          archives = sorted(
+              p for p in repo.rglob('*.zip')
+              if '.git' not in p.parts
+          )
+          if not archives:
+              raise SystemExit(
+                  'ERROR: No Android project found. Expected '
+                  'Gradle settings + app/build.gradle, or a project ZIP.'
+              )
+
+          temp_root.mkdir(parents=True, exist_ok=True)
+          roots = []
+
+          for archive in archives:
+              destination = temp_root / archive.stem
+              destination.mkdir(parents=True, exist_ok=True)
+
+              try:
+                  with zipfile.ZipFile(archive) as zf:
+                      base = destination.resolve()
+
+                      # Protect against unsafe ZIP paths.
+                      for item in zf.infolist():
+                          target = (
+                              destination / item.filename
+                          ).resolve()
+                          if target != base and base not in target.parents:
+                              raise SystemExit(
+                                  f'ERROR: Unsafe path in ZIP: '
+                                  f'{item.filename}'
+                              )
+
+                      zf.extractall(destination)
+
+              except zipfile.BadZipFile:
+                  print(
+                      f'WARNING: Skipping invalid ZIP: {archive}',
+                      flush=True
+                  )
+                  continue
+
+              roots.extend(find_roots(destination))
+
+          if not roots:
+              raise SystemExit(
+                  'ERROR: No valid Android project root found '
+                  'after ZIP extraction.'
+              )
+
+          print(sorted(
+              set(roots), key=lambda p: (len(p.parts), str(p))
+          )[0])
+          PY
+          )"
+
+          if [[ -z "$PROJECT_DIR" || ! -d "$PROJECT_DIR" ]]; then
+            echo 'ERROR: Android project directory does not exist.' >&2
+            exit 1
+          fi
+
+          [[ -f "$PROJECT_DIR/settings.gradle" || \
+             -f "$PROJECT_DIR/settings.gradle.kts" ]] || {
+            echo 'ERROR: settings.gradle(.kts) missing.' >&2
+            exit 1
+          }
+
+          [[ -f "$PROJECT_DIR/app/build.gradle" || \
+             -f "$PROJECT_DIR/app/build.gradle.kts" ]] || {
+            echo 'ERROR: app/build.gradle(.kts) missing.' >&2
+            exit 1
+          }
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using Android project: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Verify Java, Gradle, and project files
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version
+          gradle --version
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f app/build.gradle || test -f app/build.gradle.kts
+          echo 'Project checks passed.'
+
+      - name: Build debug APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify generated APK
+        id: verify_apk
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+
+          if [[ ! -f "$APK" ]]; then
+            echo "ERROR: APK was not created at $PWD/$APK" >&2
+            find app/build/outputs -maxdepth 6 -type f \
+              -print 2>/dev/null || true
+            exit 1
+          fi
+
+          if [[ ! -s "$APK" ]]; then
+            echo 'ERROR: Generated APK is empty.' >&2
+            exit 1
+          fi
+
+          echo "apk_path=$PWD/$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+          file "$APK"
+
+      - name: Run Android lint
+        id: lint
+        continue-on-error: true
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: gradle --no-daemon --stacktrace lintDebug
+
+      - name: Upload verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CryptoAnalyser-debug-apk
+          path: ${{ steps.verify_apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload lint reports if available
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CryptoAnalyser-lint-reports
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/app/build/reports/lint-results-debug.html
+            ${{ steps.locate.outputs.project_dir }}/app/build/reports/lint-results-debug.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summarize lint result
+        if: always()
+        shell: bash
+        run: |
+          if [[ '${{ steps.lint.outcome }}' == 'failure' ]]; then
+            echo '::warning::Android lint reported issues. Review the uploaded lint reports. APK build and APK verification are tracked separately.'
+          else
+            echo 'Android lint completed successfully or did not report failure.'
+          fi
