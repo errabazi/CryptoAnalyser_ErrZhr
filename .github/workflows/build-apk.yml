@@ -23,7 +23,7 @@ jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout repository
@@ -39,12 +39,34 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+          log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK packages
+      - name: Accept Android SDK licenses
+        shell: bash
         run: |
           set -euo pipefail
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-          yes | sdkmanager --licenses >/dev/null || true
+
+          set +e
+          yes | sdkmanager --licenses
+          sdk_status=${PIPESTATUS[1]}
+          set -e
+
+          if [ "$sdk_status" -ne 0 ]; then
+            echo "ERROR: Android SDK license acceptance failed."
+            exit "$sdk_status"
+          fi
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Locate or safely extract Android project
         id: locate
@@ -58,42 +80,42 @@ jobs:
           from pathlib import Path
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-          excluded = {".git", ".gradle", "build", ".idea", "node_modules"}
-          max_depth = 7
+          excluded = {
+              ".git", ".gradle", ".idea",
+              "build", "node_modules"
+          }
+          max_depth = 8
 
           def is_android_root(path):
-              settings = (
+              has_settings = (
                   (path / "settings.gradle").is_file()
                   or (path / "settings.gradle.kts").is_file()
               )
-              app_gradle = (
+              has_app = (
                   (path / "app" / "build.gradle").is_file()
                   or (path / "app" / "build.gradle.kts").is_file()
               )
-              return settings and app_gradle
+              return has_settings and has_app
 
           def find_roots(base):
               found = []
+
               for current, dirs, files in os.walk(base):
-                  current_path = Path(current)
+                  path = Path(current)
 
                   try:
-                      depth = len(current_path.relative_to(base).parts)
+                      depth = len(path.relative_to(base).parts)
                   except ValueError:
                       dirs[:] = []
                       continue
 
                   dirs[:] = [
                       d for d in dirs
-                      if d not in excluded
-                      and not d.startswith(".")
-                      and depth < max_depth
+                      if d not in excluded and depth < max_depth
                   ]
 
-                  if is_android_root(current_path):
-                      found.append(current_path)
-
-                      # Do not descend into a discovered project.
+                  if is_android_root(path):
+                      found.append(path)
                       dirs[:] = []
 
               return found
@@ -101,19 +123,20 @@ jobs:
           roots = find_roots(workspace)
 
           if not roots:
+              extraction_base = workspace / ".android-extracted"
+              extraction_base.mkdir(exist_ok=True)
+
               archives = []
               for current, dirs, files in os.walk(workspace):
                   dirs[:] = [
                       d for d in dirs
                       if d not in excluded
-                      and not d.startswith(".")
+                      and d != ".android-extracted"
                   ]
-                  for filename in files:
-                      if filename.lower().endswith(".zip"):
-                          archives.append(Path(current) / filename)
 
-              extraction_base = workspace / ".android-project-extracted"
-              extraction_base.mkdir(exist_ok=True)
+                  for name in files:
+                      if name.lower().endswith(".zip"):
+                          archives.append(Path(current) / name)
 
               for index, archive in enumerate(archives):
                   destination = extraction_base / f"archive_{index}"
@@ -123,47 +146,56 @@ jobs:
                       with zipfile.ZipFile(archive) as zf:
                           members = zf.infolist()
 
-                          # Reject suspiciously large archives.
-                          total_size = sum(item.file_size for item in members)
-                          if total_size > 500 * 1024 * 1024:
+                          if sum(m.file_size for m in members) > 500 * 1024 * 1024:
                               print(f"Skipping oversized ZIP: {archive}")
                               continue
 
-                          # Prevent path traversal during extraction.
-                          for item in members:
-                              target = (destination / item.filename).resolve()
-                              if target != destination.resolve() and destination.resolve() not in target.parents:
-                                  raise ValueError("Unsafe ZIP entry path")
+                          for member in members:
+                              target = (
+                                  destination / member.filename
+                              ).resolve()
+
+                              if (
+                                  target != destination.resolve()
+                                  and destination.resolve() not in target.parents
+                              ):
+                                  raise ValueError(
+                                      "Unsafe ZIP entry: "
+                                      + member.filename
+                                  )
 
                           zf.extractall(destination)
 
-                      roots.extend(find_roots(destination))
+                      roots = find_roots(destination)
 
                       if roots:
                           break
 
-                  except (zipfile.BadZipFile, OSError, ValueError) as error:
+                  except (OSError, ValueError, zipfile.BadZipFile) as error:
                       print(f"Could not extract {archive}: {error}")
 
-          # Prefer the shallowest valid Android project root.
-          roots = sorted(set(roots), key=lambda p: (len(p.parts), str(p)))
-
           if not roots:
-              print("Repository contents:")
+              print("Top-level repository contents:")
               for item in sorted(workspace.iterdir()):
                   print(" -", item.name)
 
               raise SystemExit(
-                  "ERROR: No Android project found. "
+                  "ERROR: Android project not found. "
                   "Expected settings.gradle(.kts) and "
-                  "app/build.gradle(.kts), possibly inside a ZIP."
+                  "app/build.gradle(.kts), directly or inside a ZIP."
               )
 
-          project = roots[0]
-          print(f"Android project root: {project}")
+          roots = sorted(
+              set(roots),
+              key=lambda p: (len(p.parts), str(p))
+          )
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"project_dir={project}\n")
+          project = roots[0].resolve()
+          print(f"Selected Android project: {project}")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as f:
+              f.write(f"project_dir={project}\n")
           PY
 
       - name: Set up Gradle
@@ -181,16 +213,16 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          echo "Building project in: $PWD"
+          echo "Project directory: $PWD"
 
-          if [[ -f "./gradlew" ]]; then
+          if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
             ./gradlew --no-daemon --stacktrace assembleDebug
           else
             gradle --no-daemon --stacktrace assembleDebug
           fi
 
-      - name: Verify APK
+      - name: Verify generated APK
         id: verify
         shell: bash
         env:
@@ -200,20 +232,17 @@ jobs:
 
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          if [[ ! -f "$APK" ]]; then
-            echo "ERROR: APK was not generated at:"
+          if [ ! -s "$APK" ]; then
+            echo "Expected APK not found or empty:"
             echo "$APK"
-            echo "Searching for APK files..."
+
+            echo "Searching for generated APK files:"
             find "$PROJECT_DIR" -type f -name "*.apk" -print || true
+
             exit 1
           fi
 
-          if [[ ! -s "$APK" ]]; then
-            echo "ERROR: APK file is empty."
-            exit 1
-          fi
-
-          echo "APK successfully generated:"
+          echo "APK generated successfully:"
           ls -lh "$APK"
 
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
@@ -226,7 +255,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build reports on failure
+      - name: Upload diagnostics if build fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
