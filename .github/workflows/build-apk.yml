@@ -2,60 +2,83 @@
 name: Build CryptoAnalyser Android APK
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
       - master
   pull_request:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: android-build-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: false
-          log-accepted-android-sdk-licenses: false
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "ERROR: Android SDK directory was not found: $SDK_ROOT"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Android SDK: $SDK_ROOT"
+          ls -la "$SDK_ROOT/cmdline-tools" || true
 
       - name: Accept Android SDK licenses
         shell: bash
         run: |
           set -euo pipefail
 
-          set +e
-          yes | sdkmanager --licenses
-          sdk_status=${PIPESTATUS[1]}
-          set -e
+          SDKMANAGER=""
 
-          if [ "$sdk_status" -ne 0 ]; then
-            echo "ERROR: Android SDK license acceptance failed."
-            exit "$sdk_status"
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            for candidate in "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager; do
+              if [ -x "$candidate" ]; then
+                SDKMANAGER="$candidate"
+              fi
+            done
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager was not found."
+            find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager || true
+            exit 1
+          fi
+
+          echo "Using: $SDKMANAGER"
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          SDK_STATUS="${PIPESTATUS[1]}"
+          set -o pipefail
+
+          if [ "$SDK_STATUS" -ne 0 ]; then
+            echo "ERROR: Could not accept Android SDK licenses."
+            exit "$SDK_STATUS"
           fi
 
       - name: Install Android SDK packages
@@ -63,13 +86,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+          SDKMANAGER=""
 
-      - name: Locate or safely extract Android project
-        id: locate
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            for candidate in "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager; do
+              if [ -x "$candidate" ]; then
+                SDKMANAGER="$candidate"
+              fi
+            done
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager was not found."
+            exit 1
+          fi
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0" \
+            "build-tools;36.0.0"
+
+      - name: Locate Android project or extract project ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -79,189 +122,175 @@ jobs:
           import zipfile
           from pathlib import Path
 
-          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          repo = Path.cwd().resolve()
+          temp = Path(os.environ["RUNNER_TEMP"]) / "cryptoanalyser-project"
+          temp.mkdir(parents=True, exist_ok=True)
+
           excluded = {
-              ".git", ".gradle", ".idea",
-              "build", "node_modules"
+              ".git", ".gradle", ".idea", "build",
+              "node_modules", ".github"
           }
-          max_depth = 8
 
-          def is_android_root(path):
-              has_settings = (
-                  (path / "settings.gradle").is_file()
-                  or (path / "settings.gradle.kts").is_file()
+          def is_gradle_file(directory, base):
+              return (
+                  (directory / f"{base}.gradle").is_file()
+                  or (directory / f"{base}.gradle.kts").is_file()
               )
-              has_app = (
-                  (path / "app" / "build.gradle").is_file()
-                  or (path / "app" / "build.gradle.kts").is_file()
-              )
-              return has_settings and has_app
 
-          def find_roots(base):
+          def find_projects(base):
               found = []
 
-              for current, dirs, files in os.walk(base):
-                  path = Path(current)
-
-                  try:
-                      depth = len(path.relative_to(base).parts)
-                  except ValueError:
-                      dirs[:] = []
-                      continue
-
-                  dirs[:] = [
-                      d for d in dirs
-                      if d not in excluded and depth < max_depth
-                  ]
-
-                  if is_android_root(path):
-                      found.append(path)
-                      dirs[:] = []
-
-              return found
-
-          roots = find_roots(workspace)
-
-          if not roots:
-              extraction_base = workspace / ".android-extracted"
-              extraction_base.mkdir(exist_ok=True)
-
-              archives = []
-              for current, dirs, files in os.walk(workspace):
+              for root, dirs, files in os.walk(base):
                   dirs[:] = [
                       d for d in dirs
                       if d not in excluded
-                      and d != ".android-extracted"
                   ]
 
-                  for name in files:
-                      if name.lower().endswith(".zip"):
-                          archives.append(Path(current) / name)
+                  directory = Path(root)
 
-              for index, archive in enumerate(archives):
-                  destination = extraction_base / f"archive_{index}"
+                  has_settings = (
+                      (directory / "settings.gradle").is_file()
+                      or (directory / "settings.gradle.kts").is_file()
+                  )
+
+                  has_app = (
+                      is_gradle_file(directory / "app", "build")
+                  )
+
+                  if has_settings and has_app:
+                      found.append(directory)
+
+              return sorted(
+                  found,
+                  key=lambda p: (len(p.parts), str(p))
+              )
+
+          projects = find_projects(repo)
+
+          if projects:
+              project = projects[0]
+              print(f"Found Android project: {project}")
+          else:
+              archives = sorted(
+                  p for p in repo.rglob("*.zip")
+                  if ".git" not in p.parts
+              )
+
+              project = None
+
+              for archive in archives:
+                  destination = temp / archive.stem
                   destination.mkdir(parents=True, exist_ok=True)
 
                   try:
                       with zipfile.ZipFile(archive) as zf:
-                          members = zf.infolist()
+                          for member in zf.infolist():
+                              target = (destination / member.filename).resolve()
 
-                          if sum(m.file_size for m in members) > 500 * 1024 * 1024:
-                              print(f"Skipping oversized ZIP: {archive}")
-                              continue
-
-                          for member in members:
-                              target = (
-                                  destination / member.filename
-                              ).resolve()
-
-                              if (
-                                  target != destination.resolve()
-                                  and destination.resolve() not in target.parents
-                              ):
+                              if not target.is_relative_to(destination.resolve()):
                                   raise ValueError(
-                                      "Unsafe ZIP entry: "
-                                      + member.filename
+                                      f"Unsafe ZIP entry: {member.filename}"
                                   )
 
                           zf.extractall(destination)
 
-                      roots = find_roots(destination)
+                  except Exception as exc:
+                      print(f"Skipping {archive.name}: {exc}")
+                      continue
 
-                      if roots:
-                          break
+                  extracted_projects = find_projects(destination)
 
-                  except (OSError, ValueError, zipfile.BadZipFile) as error:
-                      print(f"Could not extract {archive}: {error}")
+                  if extracted_projects:
+                      project = extracted_projects[0]
+                      print(f"Found Android project in {archive.name}")
+                      break
 
-          if not roots:
-              print("Top-level repository contents:")
-              for item in sorted(workspace.iterdir()):
-                  print(" -", item.name)
+              if project is None:
+                  raise SystemExit(
+                      "ERROR: No Android project found. "
+                      "Expected settings.gradle(.kts) and app/build.gradle(.kts), "
+                      "either in the repository or inside a ZIP archive."
+                  )
 
-              raise SystemExit(
-                  "ERROR: Android project not found. "
-                  "Expected settings.gradle(.kts) and "
-                  "app/build.gradle(.kts), directly or inside a ZIP."
-              )
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"PROJECT_DIR={project}\n")
 
-          roots = sorted(
-              set(roots),
-              key=lambda p: (len(p.parts), str(p))
-          )
-
-          project = roots[0].resolve()
-          print(f"Selected Android project: {project}")
-
-          output = Path(os.environ["GITHUB_OUTPUT"])
-          with output.open("a", encoding="utf-8") as f:
-              f.write(f"project_dir={project}\n")
+          print(f"Project root: {project}")
           PY
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.11.1'
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
+          gradle-version: "8.11.1"
 
       - name: Build debug APK
         shell: bash
-        env:
-          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          echo "Project directory: $PWD"
+          echo "Project directory: $PROJECT_DIR"
+          echo "Java version:"
+          java -version
+
+          echo "Gradle files:"
+          ls -la
 
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            ./gradlew --no-daemon --stacktrace assembleDebug
+            ./gradlew --no-daemon assembleDebug
+          elif command -v gradle >/dev/null 2>&1; then
+            gradle --no-daemon assembleDebug
           else
-            gradle --no-daemon --stacktrace assembleDebug
-          fi
-
-      - name: Verify generated APK
-        id: verify
-        shell: bash
-        env:
-          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "Expected APK not found or empty:"
-            echo "$APK"
-
-            echo "Searching for generated APK files:"
-            find "$PROJECT_DIR" -type f -name "*.apk" -print || true
-
+            echo "ERROR: Neither gradlew nor Gradle is available."
             exit 1
           fi
 
-          echo "APK generated successfully:"
+          echo "Searching for generated APK..."
+
+          APK="$(find "$PROJECT_DIR" \
+            -type f \
+            -path '*/build/outputs/apk/*/*.apk' \
+            -size +0c \
+            -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: Build finished without producing a non-empty APK."
+            find "$PROJECT_DIR" -type f \
+              \( -name "*.apk" -o -name "*.log" \) -print || true
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "APK generated successfully: $APK"
           ls -lh "$APK"
 
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
-
-      - name: Upload debug APK
+      - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: CryptoAnalyser-debug-apk
-          path: ${{ steps.verify.outputs.apk_path }}
+          name: CryptoAnalyser-debug-APK
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload diagnostics if build fails
+      - name: Show build diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: CryptoAnalyser-build-diagnostics
-          path: |
-            **/build/reports/**
-            **/build/test-results/**
-          if-no-files-found: ignore
-          retention-days: 7
+        shell: bash
+        run: |
+          echo "Android build failed."
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Java version:"
+          java -version || true
+          echo "Android SDK:"
+          echo "${ANDROID_HOME:-not set}"
+          echo "Project directory:"
+          echo "${PROJECT_DIR:-not detected}"
+
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+            find "$PROJECT_DIR" -maxdepth 5 \
+              \( -name "*.apk" -o -name "*.log" \) \
+              -type f -print || true
+          fi
